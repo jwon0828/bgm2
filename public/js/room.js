@@ -15,6 +15,8 @@ let roomState   = null;
 let ytPlayer    = null;
 let ytReady     = false;
 let pendingPlay = null;
+let ambPlayer   = null;
+let ambReady    = false;
 let addSongTargetPlaylistId = null; // null = standalone queue
 let songEndedLock = false; // 중복 song-ended 방지
 let moveSongData = null;
@@ -25,6 +27,10 @@ if (!ROOM_ID) window.location.href = '/';
 
 // ── Socket ────────────────────────────────────────
 const socket = io();
+
+document.addEventListener('DOMContentLoaded', () => {
+  initMiniPlayer();
+});
 
 socket.on('connect', () => {
   if (!roomState) {
@@ -77,6 +83,7 @@ socket.on('room-state', state => {
     updateNowPlaying(state.currentSong);
     if (state.isPlaying) playYT(state.currentSong.videoId, state.currentTime);
   }
+  if (state.ambience) applyAmbienceState(state.ambience);
   // isHost 확정 후 처리
   if (isHost) {
     // 호스트: ytReady 상태면 즉시 unMute (mute:1 초기화 상태 해제)
@@ -97,6 +104,12 @@ socket.on('room-state', state => {
       tp.style.right    = '1.5rem';
       tp.style.zIndex   = '3000';
     }
+    // 게스트: 미니 플레이어를 body로 이동 후 테마 버튼 아래 fixed 배치
+    const mp = document.getElementById('mini-player-wrap');
+    if (mp && mp.parentElement !== document.body) {
+      document.body.appendChild(mp);
+    }
+    updateMiniPlayerPosition();
     // 게스트 입장 공지 모달 (오늘 하루 보지 않기)
     const GUEST_NOTICE_KEY = 'jukesync-guest-notice-date';
     const today = new Date().toISOString().slice(0, 10);
@@ -121,6 +134,115 @@ socket.on('room-state', state => {
     }
   }
   log(`"${state.name}" 방에 입장했습니다. 코드: ${state.code}`, 'system');
+});
+
+socket.on('capacity-warning', ({ total, max }) => {
+  const msg = `이 방의 곡이 ${total}곡으로 한도(${max}곡)에 근접했습니다. 사용하지 않는 곡을 정리해주세요.`;
+  log(msg, 'error');
+
+  const KEY = `jukesync-capacity-dismissed-${ROOM_ID}`;
+  if (localStorage.getItem(KEY) === '1') return;
+
+  const modal = document.getElementById('capacity-warning-modal');
+  if (!modal) { toast('⚠️ ' + msg, 'error', true); return; }
+  if (!modal.classList.contains('hidden')) return;
+
+  document.getElementById('capacity-warning-text').textContent = msg;
+  document.getElementById('capacity-warning-no-show').checked = false;
+  modal.classList.remove('hidden');
+
+  const close = () => {
+    if (document.getElementById('capacity-warning-no-show')?.checked) {
+      localStorage.setItem(KEY, '1');
+    }
+    modal.classList.add('hidden');
+  };
+  document.getElementById('capacity-warning-close').onclick = close;
+  modal.onclick = e => { if (e.target === modal) close(); };
+});
+
+socket.on('save-failed', ({ reason }) => {
+  toast('⚠️ ' + reason, 'error', true);
+  log(reason, 'error');
+});
+
+socket.on('resync-state', state => {
+  if (!roomState) return; // 아직 최초 room-state를 못 받은 상태면 무시 (곧 room-state가 옴)
+
+  roomState.volume  = state.volume;
+  roomState.shuffle = state.shuffle;
+  roomState.repeat  = state.repeat;
+  roomState.playlists = state.playlists;
+  roomState.queue     = state.queue;
+
+  applyVolume(state.volume);
+  const volSliderEl = document.getElementById('volume-slider');
+  if (volSliderEl) volSliderEl.value = state.volume;
+  updateShuffleBtn(state.shuffle);
+  updateRepeatBtn(state.repeat);
+  renderPlaylists(state.playlists);
+  renderQueue(state.queue);
+
+  const prevSong = roomState.currentSong;
+  roomState.currentSong = state.currentSong;
+  roomState.isPlaying   = state.isPlaying;
+  roomState.currentTime = state.currentTime;
+
+  if (state.ambience) applyAmbienceState(state.ambience);
+
+  if (!state.currentSong) {
+    if (ytPlayer && ytReady) ytPlayer.stopVideo();
+    updateNowPlaying(null);
+    highlightCurrentSong(null);
+    updatePlayBtn(false);
+    return;
+  }
+
+  updateNowPlaying(state.currentSong);
+  highlightCurrentSong(state.currentSong.id);
+
+  if (!ytPlayer || !ytReady) { pendingPlay = { videoId: state.currentSong.videoId, time: state.currentTime }; return; }
+
+  let loadedVideoId = null;
+  try { loadedVideoId = ytPlayer.getVideoData()?.video_id || null; } catch (e) { /* 플레이어 초기화 전일 수 있음 */ }
+
+  const songChanged = !prevSong || prevSong.videoId !== state.currentSong.videoId || loadedVideoId !== state.currentSong.videoId;
+
+  if (songChanged) {
+    // 끊긴 사이 곡이 바뀐 경우 — 새로 로드
+    playYT(state.currentSong.videoId, state.currentTime);
+    if (!state.isPlaying) { setTimeout(() => ytPlayer.pauseVideo(), 300); }
+    updatePlayBtn(state.isPlaying);
+    return;
+  }
+
+  // 같은 곡이면 재생/일시정지 상태와 시간 드리프트만 바로잡는다 (불필요한 재시작 방지)
+  const actuallyPlaying = ytPlayer.getPlayerState() === YT.PlayerState.PLAYING;
+  if (state.isPlaying && !actuallyPlaying) {
+    ytPlayer.seekTo(state.currentTime, true);
+    if (isHost) { ytPlayer.unMute(); ytPlayer.setVolume(state.volume ?? 80); ytPlayer.playVideo(); }
+    else if (audioUnlocked) { ytPlayer.unMute(); ytPlayer.setVolume(calcGuestVolume()); ytPlayer.playVideo(); }
+    else { ytPlayer.mute(); showUnlockBanner(); }
+  } else if (!state.isPlaying && actuallyPlaying) {
+    ytPlayer.pauseVideo();
+    ytPlayer.seekTo(state.currentTime, true);
+  } else if (state.isPlaying && actuallyPlaying) {
+    // 드리프트가 크면(3초 이상)만 보정 — 작은 오차는 자연스럽게 두어 끊김을 줄인다
+    const drift = Math.abs((ytPlayer.getCurrentTime() || 0) - state.currentTime);
+    if (drift > 3) ytPlayer.seekTo(state.currentTime, true);
+  }
+  updatePlayBtn(state.isPlaying);
+});
+
+socket.on('ambience-update', amb => applyAmbienceState(amb));
+
+socket.on('ambience-volume', ({ volume }) => {
+  if (roomState && roomState.ambience) roomState.ambience.volume = volume;
+  const volSlider = document.getElementById('ambience-volume-slider');
+  if (volSlider) volSlider.value = volume;
+  if (ambPlayer && ambReady && (isHost || audioUnlocked)) {
+    setAmbVolumeTracked(isHost ? volume : calcGuestAmbienceVolume());
+  }
 });
 
 socket.on('room-renamed', ({ name }) => {
@@ -225,8 +347,8 @@ socket.on('queue-update', queue => {
 // ── YouTube API ───────────────────────────────────
 window.onYouTubeIframeAPIReady = function () {
   ytPlayer = new YT.Player('yt-player', {
-    height: '1', width: '1',
-    playerVars: { autoplay: 0, controls: 0, mute: 1 },
+    height: '200', width: '200',
+    playerVars: { autoplay: 0, controls: 0, mute: 1, disablekb: 1 },
     events: {
       onReady: () => {
         ytReady = true;
@@ -262,12 +384,69 @@ window.onYouTubeIframeAPIReady = function () {
         }
         if (e.data === YT.PlayerState.PLAYING) {
           updatePlayBtn(true);
-          // 버그 1: 일시정지 상태인데 YouTube가 자동 재생을 재개한 경우 강제 정지
-          if (isHost && roomState && !roomState.isPlaying) {
+          // 일시정지 상태여야 하는데 재생이 시작된 경우 강제 정지
+          // (호스트: 유튜브가 자동으로 재생을 재개하는 버그 방지 / 게스트: 직접 클릭해 재생 시도 방지)
+          if (roomState && !roomState.isPlaying) {
             ytPlayer.pauseVideo();
           }
         }
-        if (e.data === YT.PlayerState.PAUSED)  updatePlayBtn(false);
+        if (e.data === YT.PlayerState.PAUSED) {
+          updatePlayBtn(false);
+          // 게스트가 영상을 직접 클릭해 일시정지한 경우 즉시 되돌림 (재생 제어는 호스트 전용)
+          if (!isHost && roomState && roomState.isPlaying) {
+            ytPlayer.playVideo();
+          }
+        }
+      }
+    }
+  });
+
+  // 앰비언스(효과음) 전용 보조 플레이어 — 메인과 완전히 독립적으로 동작
+  ambPlayer = new YT.Player('amb-player', {
+    height: '200', width: '200',
+    playerVars: { autoplay: 0, controls: 0, mute: 1, disablekb: 1 },
+    events: {
+      onReady: () => {
+        ambReady = true;
+        if (isHost) {
+          ambPlayer.unMute();
+          ambPlayer.setVolume(roomState?.ambience?.volume ?? 60);
+        }
+        // room-state/resync-state가 이미 도착해있었다면 그때 저장해둔 상태를 지금 적용
+        if (roomState && roomState.ambience) applyAmbienceState(roomState.ambience);
+      },
+      onError: () => {
+        toast('⚠️ 효과음 재생 오류가 발생했습니다.', 'error');
+      },
+      onStateChange: e => {
+        if (e.data === YT.PlayerState.ENDED) {
+          // 앰비언스는 항상 무한 반복 — 각자 되감아 재생한다
+          ambPlayer.seekTo(0, true);
+          ambPlayer.playVideo();
+          // 호스트만 서버에 알려 재생 위치 기준점을 0으로 초기화시킨다.
+          // (BGM의 song-ended와 같은 구조. 이게 없으면 서버의 currentTime이 무한정 커진다)
+          if (isHost && !ambEndedLock) {
+            ambEndedLock = true;
+            socket.emit('ambience-ended');
+            setTimeout(() => { ambEndedLock = false; }, 3000);
+          }
+        }
+        if (e.data === YT.PlayerState.PLAYING) {
+          if (roomState && roomState.ambience && !roomState.ambience.isPlaying) {
+            ambPlayer.pauseVideo();
+          } else if (ambPendingFadeIn) {
+            // 재생 명령을 보낸 시점이 아니라, 버퍼링이 끝나 실제로 소리가 나기 시작하는
+            // 지금 이 순간부터 페이드를 시작해야 타이밍이 어긋나지 않는다.
+            ambPendingFadeIn = false;
+            const target = isHost ? (roomState?.ambience?.volume ?? 60) : calcGuestAmbienceVolume();
+            fadeAmbVolume(0, target);
+          }
+        }
+        if (e.data === YT.PlayerState.PAUSED) {
+          if (!isHost && roomState && roomState.ambience && roomState.ambience.isPlaying) {
+            ambPlayer.playVideo();
+          }
+        }
       }
     }
   });
@@ -279,6 +458,130 @@ document.head.appendChild(ytScript);
 
 let audioUnlocked = false;
 let pendingBanner  = false; // ytReady 전에 room-state가 먼저 도착한 경우를 위한 플래그
+
+// ── 앰비언스(효과음) ────────────────────────────────
+// 서버에서 온 ambience 객체 하나로 UI와 플레이어 상태를 전부 맞추는 단일 진입점.
+// room-state / resync-state / ambience-update 세 곳에서 공통으로 호출한다.
+function applyAmbienceState(amb) {
+  if (roomState) roomState.ambience = amb;
+
+  const titleEl   = document.getElementById('ambience-current-title');
+  const playBtn   = document.getElementById('ambience-play-btn');
+  const volSlider = document.getElementById('ambience-volume-slider');
+  if (titleEl) titleEl.textContent = (amb && amb.videoId) ? amb.title : '선택된 곡 없음';
+  if (playBtn) {
+    playBtn.disabled = !(amb && amb.videoId);
+    playBtn.textContent = (amb && amb.isPlaying) ? '⏸' : '▶';
+  }
+  if (volSlider && amb) volSlider.value = amb.volume;
+
+  if (!ambPlayer || !ambReady) return; // 준비되면 onReady에서 roomState.ambience를 다시 적용함
+  if (!amb || !amb.videoId) { ambPlayer.stopVideo(); return; }
+
+  if (!amb.isPlaying) {
+    // 재생 중이 아니면 미리 로드해두지 않는다 (페이드/재생 시점과 겹치는 경합 방지).
+    // 이미 로드되어 재생되고 있었다면 페이드아웃 후 정지만 처리한다.
+    const wasPlaying = ambPlayer.getPlayerState() === YT.PlayerState.PLAYING;
+    if (wasPlaying) fadeOutAndPauseAmb();
+    return;
+  }
+
+  // 여기부터는 실제로 재생해야 하는 경우
+  let loadedId = null;
+  try { loadedId = ambPlayer.getVideoData()?.video_id || null; } catch (e) { /* 초기화 전일 수 있음 */ }
+
+  if (loadedId !== amb.videoId) {
+    // 곡이 바뀌었거나 아직 한 번도 로드된 적 없는 경우 — 로드와 동시에 페이드인
+    ambPlayer.loadVideoById({ videoId: amb.videoId, startSeconds: amb.currentTime || 0 });
+    // 상태 메시지가 짧은 간격으로 두 번 오면 이 예약이 중복으로 걸려
+    // 페이드가 도중에 0으로 되돌아갔다가 다시 올라가는 현상이 생긴다. 이전 예약은 취소한다.
+    clearTimeout(ambLoadTimer);
+    ambLoadTimer = setTimeout(() => {
+      if (!roomState?.ambience?.isPlaying) return;
+      applyAmbMuteState();
+      fadeInAmbAfterPlay();
+    }, 150);
+    return;
+  }
+
+  // 같은 곡이 이미 로드되어 있는 경우 — 재생/정지 전환과 시간 드리프트만 처리
+  applyAmbMuteState();
+  const actuallyPlaying = ambPlayer.getPlayerState() === YT.PlayerState.PLAYING;
+  if (!actuallyPlaying) {
+    ambPlayer.seekTo(amb.currentTime, true);
+    ambPlayer.playVideo();
+    fadeInAmbAfterPlay();
+  } else {
+    const drift = Math.abs((ambPlayer.getCurrentTime() || 0) - amb.currentTime);
+    if (drift > 3) ambPlayer.seekTo(amb.currentTime, true);
+  }
+}
+
+function applyAmbMuteState() {
+  if (!ambPlayer || !ambReady) return;
+  if (isHost || audioUnlocked) {
+    ambPlayer.unMute();
+    setAmbVolumeTracked(isHost ? (roomState?.ambience?.volume ?? 60) : calcGuestAmbienceVolume());
+  } else {
+    ambPlayer.mute();
+    showUnlockBanner();
+  }
+}
+
+// ── 앰비언스 페이드인/아웃 (2초) ──
+// 효과음 특성상 재생/정지가 뚝 끊기지 않도록, 재생 시작 시 0→목표볼륨으로 서서히 올리고
+// 정지할 때는 목표볼륨→0으로 서서히 낮춘 뒤에 실제로 pauseVideo()한다.
+let ambFadeInterval   = null;
+let ambCurrentVolume  = 0;     // getVolume()은 iframe에서 값이 돌아올 때까지 지연이 있어 신뢰할 수 없다.
+                                // 우리가 마지막으로 보낸 볼륨을 직접 추적해서 사용한다.
+let ambEndedLock      = false; // 반복 시 ambience-ended가 중복 전송되는 것을 막는 잠금
+let ambLoadTimer      = null;  // 곡 로드 후 페이드 시작을 미뤄두는 예약 (중복 방지용)
+let ambPendingFadeIn  = false; // "재생 명령을 보낸 시점"이 아니라 "실제로 PLAYING 상태가 된 시점"에
+                                // 페이드를 시작하기 위한 플래그 (버퍼링 지연 때문에 타이밍이 어긋나는 것 방지)
+const AMB_FADE_MS      = 2000;
+const AMB_FADE_STEP_MS = 50;
+
+function setAmbVolumeTracked(v) {
+  ambCurrentVolume = v;
+  if (ambPlayer && ambReady) ambPlayer.setVolume(v);
+}
+
+function fadeAmbVolume(fromVolume, toVolume, onDone) {
+  if (!ambPlayer || !ambReady) { if (onDone) onDone(); return; }
+  clearInterval(ambFadeInterval);
+  const steps = Math.max(1, Math.round(AMB_FADE_MS / AMB_FADE_STEP_MS));
+  let step = 0;
+  ambFadeInterval = setInterval(() => {
+    step++;
+    const t = step / steps;
+    const vol = Math.round(fromVolume + (toVolume - fromVolume) * t);
+    setAmbVolumeTracked(Math.max(0, Math.min(100, vol)));
+    if (step >= steps) {
+      clearInterval(ambFadeInterval);
+      ambFadeInterval = null;
+      if (onDone) onDone();
+    }
+  }, AMB_FADE_STEP_MS);
+}
+
+// 정지 전 페이드아웃 후 실제 pauseVideo() 호출
+function fadeOutAndPauseAmb() {
+  if (!ambPlayer || !ambReady) return;
+  ambPendingFadeIn = false; // 혹시 페이드인 대기 중이었다면 취소
+  const canHear = isHost || audioUnlocked;
+  if (!canHear) { ambPlayer.pauseVideo(); return; }
+  fadeAmbVolume(ambCurrentVolume, 0, () => ambPlayer.pauseVideo());
+}
+
+// 재생 명령을 보낼 때 호출 — 실제 소리는 아직 내지 않고(0으로 유지),
+// 실제로 PLAYING 상태가 되는 순간 onStateChange에서 페이드를 시작한다.
+function fadeInAmbAfterPlay() {
+  if (!ambPlayer || !ambReady) return;
+  const canHear = isHost || audioUnlocked;
+  if (!canHear) return;
+  setAmbVolumeTracked(0);
+  ambPendingFadeIn = true;
+}
 
 function playYT(videoId, time) {
   if (!ytReady) { pendingPlay = { videoId, time }; return; }
@@ -309,6 +612,16 @@ function unlockAudio() {
       ytPlayer.playVideo();
     }
   }
+  // 앰비언스도 함께 언뮤트 — 이미 켜져 있었다면 지금 소리가 나야 하고,
+  // 아직 안 켜져 있었다면(케이스 A) 나중에 호스트가 처음 켤 때 audioUnlocked를 보고 자동으로 언뮤트된다(케이스 B).
+  if (ambPlayer && ambReady && roomState?.ambience?.videoId) {
+    ambPlayer.unMute();
+    setAmbVolumeTracked(isHost ? (roomState?.ambience?.volume ?? 60) : calcGuestAmbienceVolume());
+    if (ambPlayer.getPlayerState() !== YT.PlayerState.PLAYING && roomState?.ambience?.isPlaying) {
+      ambPlayer.seekTo(roomState.ambience.currentTime || 0, true);
+      ambPlayer.playVideo();
+    }
+  }
   hideUnlockBanner();
 }
 
@@ -335,6 +648,14 @@ function hideUnlockBanner() {
 // 예) 마스터 60, 로컬 50% → 실제 30 (컴퓨터 볼륨 × 스피커 볼륨 개념)
 function calcGuestVolume() {
   const masterVol   = roomState?.volume ?? 100;
+  const guestSlider = document.getElementById('guest-volume-slider');
+  const localVol    = guestSlider ? parseInt(guestSlider.value) : 100;
+  return Math.round((masterVol / 100) * localVol);
+}
+
+// 게스트의 로컬 슬라이더는 BGM뿐 아니라 효과음(앰비언스)에도 동일한 비율로 적용된다.
+function calcGuestAmbienceVolume() {
+  const masterVol   = roomState?.ambience?.volume ?? 60;
   const guestSlider = document.getElementById('guest-volume-slider');
   const localVol    = guestSlider ? parseInt(guestSlider.value) : 100;
   return Math.round((masterVol / 100) * localVol);
@@ -454,13 +775,16 @@ document.getElementById('volume-slider').oninput = e => {
 };
 
 // Guest local volume (does NOT emit to server — local only)
-// 실제 볼륨 = 마스터(호스트) × 로컬 비율(게스트) / 100
+// 실제 볼륨 = 마스터(호스트) × 로컬 비율(게스트) / 100 — BGM과 효과음 둘 다 적용
 const guestVolSlider = document.getElementById('guest-volume-slider');
 if (guestVolSlider) {
   guestVolSlider.oninput = e => {
     const label = document.getElementById('guest-vol-label');
     if (label) label.textContent = e.target.value;
     if (ytPlayer && ytReady) ytPlayer.setVolume(calcGuestVolume());
+    if (ambPlayer && ambReady && audioUnlocked && roomState?.ambience?.videoId) {
+      setAmbVolumeTracked(calcGuestAmbienceVolume());
+    }
   };
 }
 
@@ -548,11 +872,11 @@ function updateNowPlaying(song) {
   const bigArt   = document.getElementById('guest-big-art');
   const anim     = document.getElementById('guest-anim');
   if (bigTitle) bigTitle.innerHTML = song
-    ? `<a class="song-yt-link guest-title-link" href="https://www.youtube.com/watch?v=${song.videoId}" target="_blank" rel="noopener" title="YouTube에서 열기">${esc(song.title)}</a>`
+    ? `<a class="song-yt-link guest-title-link" href="https://www.youtube.com/watch?v=${esc(song.videoId)}" target="_blank" rel="noopener" title="YouTube에서 열기">${esc(song.title)}</a>`
     : '재생 중인 곡 없음';
   if (bigCh)    bigCh.textContent    = song ? (song.channelTitle || '—') : '—';
   if (bigArt)   bigArt.innerHTML     = song
-    ? `<img src="https://img.youtube.com/vi/${song.videoId}/hqdefault.jpg" alt="" />`
+    ? `<img src="https://img.youtube.com/vi/${esc(song.videoId)}/hqdefault.jpg" alt="" />`
     : '♪';
   if (anim) anim.style.display = song ? '' : 'none';
 }
@@ -668,9 +992,9 @@ function renderSongs(songs, playlistId, containerId) {
 
     item.innerHTML = `
       <div class="song-drag-handle">⠿</div>
-      <img class="song-thumb" src="https://img.youtube.com/vi/${song.videoId}/default.jpg" alt="" loading="lazy" />
+      <img class="song-thumb" src="https://img.youtube.com/vi/${esc(song.videoId)}/default.jpg" alt="" loading="lazy" />
       <div class="song-info">
-        <p class="song-title"><a class="song-yt-link" href="https://www.youtube.com/watch?v=${song.videoId}" target="_blank" rel="noopener" title="YouTube에서 열기">${esc(song.title)}</a></p>
+        <p class="song-title"><a class="song-yt-link" href="https://www.youtube.com/watch?v=${esc(song.videoId)}" target="_blank" rel="noopener" title="YouTube에서 열기">${esc(song.title)}</a></p>
         <p class="song-ch">${esc(song.channelTitle || '')}</p>
         ${song.memo ? `<p class="song-memo">${esc(song.memo)}</p>` : ''}
       </div>
@@ -854,6 +1178,98 @@ function openMoveSong(songId, fromPlaylistId) {
 
 document.getElementById('move-song-cancel').onclick = () => document.getElementById('move-song-modal').classList.add('hidden');
 
+// ── Ambience(효과음) 패널 UI ─────────────────────
+(function() {
+  const toggle = document.getElementById('ambience-toggle');
+  const body   = document.getElementById('ambience-body');
+  const icon   = document.getElementById('ambience-toggle-icon');
+  if (!toggle) return; // 게스트 화면엔 사이드바 자체가 없음
+
+  toggle.addEventListener('click', () => {
+    body.classList.toggle('hidden');
+    icon.textContent = body.classList.contains('hidden') ? '▸' : '▾';
+  });
+
+  document.getElementById('ambience-play-btn').addEventListener('click', () => {
+    if (!roomState?.ambience?.videoId) return;
+    if (roomState.ambience.isPlaying) {
+      const t = (ambPlayer && ambReady) ? ambPlayer.getCurrentTime() : roomState.ambience.currentTime;
+      socket.emit('pause-ambience', { time: t });
+    } else {
+      socket.emit('play-ambience');
+    }
+  });
+
+  const ambVolSlider = document.getElementById('ambience-volume-slider');
+  ambVolSlider.addEventListener('input', () => {
+    socket.emit('ambience-volume', { volume: parseInt(ambVolSlider.value, 10) });
+  });
+
+  // ── 곡 선택 모달 (2단계: 재생목록 -> 곡) ──
+  const pickerModal = document.getElementById('ambience-picker-modal');
+  const pickerList   = document.getElementById('ambience-picker-list');
+  const pickerDesc    = document.getElementById('ambience-picker-desc');
+  const pickerBack    = document.getElementById('ambience-picker-back');
+
+  function renderAmbiencePlaylistStep() {
+    pickerDesc.textContent = '재생목록을 선택하세요';
+    pickerBack.classList.add('hidden');
+    pickerBack.onclick = null;
+    pickerList.innerHTML = '';
+    const playlists = roomState?.playlists || [];
+    if (playlists.length === 0) {
+      const p = document.createElement('p');
+      p.style.cssText = 'color:var(--text-muted);font-size:0.85rem;';
+      p.textContent = '재생목록이 없습니다. 먼저 재생목록을 만들어주세요.';
+      pickerList.appendChild(p);
+      return;
+    }
+    playlists.forEach(pl => {
+      const btn = document.createElement('button');
+      btn.className = 'move-target-btn';
+      btn.textContent = `${pl.name} (${(pl.songs || []).length}곡)`;
+      btn.onclick = () => renderAmbienceSongStep(pl);
+      pickerList.appendChild(btn);
+    });
+  }
+
+  function renderAmbienceSongStep(playlist) {
+    pickerDesc.textContent = `${playlist.name} — 곡을 선택하세요`;
+    pickerBack.classList.remove('hidden');
+    pickerBack.onclick = renderAmbiencePlaylistStep;
+    pickerList.innerHTML = '';
+    const songs = playlist.songs || [];
+    if (songs.length === 0) {
+      const p = document.createElement('p');
+      p.style.cssText = 'color:var(--text-muted);font-size:0.85rem;';
+      p.textContent = '이 재생목록에는 곡이 없습니다.';
+      pickerList.appendChild(p);
+      return;
+    }
+    songs.forEach(song => {
+      const btn = document.createElement('button');
+      btn.className = 'move-target-btn';
+      btn.textContent = song.title;
+      btn.onclick = () => {
+        socket.emit('set-ambience', { song: { videoId: song.videoId, title: song.title } });
+        pickerModal.classList.add('hidden');
+      };
+      pickerList.appendChild(btn);
+    });
+  }
+
+  document.getElementById('ambience-select-btn').addEventListener('click', () => {
+    renderAmbiencePlaylistStep();
+    pickerModal.classList.remove('hidden');
+  });
+  document.getElementById('ambience-picker-cancel').addEventListener('click', () => {
+    pickerModal.classList.add('hidden');
+  });
+  pickerModal.addEventListener('click', e => {
+    if (e.target === pickerModal) pickerModal.classList.add('hidden');
+  });
+})();
+
 // ── Drag & Drop ───────────────────────────────────
 function setupPlaylistDrag(section, idx) {
   const handle = section.querySelector('.playlist-drag-handle');
@@ -912,6 +1328,50 @@ function log(msg, type = 'system') {
 
 // ── Toast ─────────────────────────────────────────
 
+// ── 미니 플레이어 ──────────────────────────────────────
+const MINI_PLAYER_KEY = 'jukesync-mini-player-open';
+
+function initMiniPlayer() {
+  const toggle = document.getElementById('mini-player-toggle');
+  const body   = document.getElementById('mini-player-body');
+  const icon   = document.getElementById('mini-player-toggle-icon');
+  if (!toggle || !body) return;
+
+  // 저장된 상태 복원 (기본값: 닫힘)
+  const isOpen = localStorage.getItem(MINI_PLAYER_KEY) === '1';
+  if (isOpen) {
+    body.classList.add('open');
+    icon.textContent = '▼ 영상 숨기기';
+  } else {
+    icon.textContent = '▶ 영상 보기';
+  }
+
+  toggle.addEventListener('click', () => {
+    const opening = !body.classList.contains('open');
+    body.classList.toggle('open');
+    icon.textContent = opening ? '▼ 영상 숨기기' : '▶ 영상 보기';
+    localStorage.setItem(MINI_PLAYER_KEY, opening ? '1' : '0');
+  });
+}
+
+function updateMiniPlayerPosition() {
+  const wrap = document.getElementById('mini-player-wrap');
+  if (!wrap) return;
+  if (isHost) {
+    wrap.classList.remove('mini-player-fixed');
+    return;
+  }
+  // 게스트: fixed 배치, 테마 버튼 아래
+  wrap.classList.add('mini-player-fixed');
+  const searchSection = document.getElementById('search-section');
+  if (searchSection && !searchSection.classList.contains('collapsed')) {
+    const w = searchSection.getBoundingClientRect().width;
+    wrap.style.right = (w + 24) + 'px';
+  } else {
+    wrap.style.right = '1.5rem';
+  }
+}
+
 function toast(msg, type = 'info', large = false) {
   const t = document.createElement('div');
   t.className = `toast toast--${type}${large ? ' toast--large' : ''}`;
@@ -949,11 +1409,16 @@ document.getElementById('custom-memo-input').addEventListener('keydown', e => { 
 
 // ── Playlist Export / Import ──────────────────────
 
+let _currentSharePl = null;
+
 async function exportPlaylist(pl) {
+  _currentSharePl = pl;
   const btn = document.getElementById('share-code-value');
   const hint = document.getElementById('share-code-hint');
+  const songlistHint = document.getElementById('share-songlist-hint');
   btn.textContent = '생성 중...';
-  hint.textContent = '클릭하면 복사됩니다';
+  hint.textContent = '코드를 클릭하면 복사됩니다';
+  if (songlistHint) songlistHint.textContent = '';
   document.getElementById('share-code-modal').classList.remove('hidden');
 
   try {
@@ -976,12 +1441,35 @@ document.getElementById('share-code-value').addEventListener('click', () => {
   if (!code || code === '생성 중...') return;
   navigator.clipboard.writeText(code).then(() => {
     document.getElementById('share-code-hint').textContent = '✅ 복사되었습니다!';
-    setTimeout(() => { document.getElementById('share-code-hint').textContent = '클릭하면 복사됩니다'; }, 2000);
+    setTimeout(() => { document.getElementById('share-code-hint').textContent = '코드를 클릭하면 복사됩니다'; }, 2000);
   });
 });
 
 document.getElementById('share-code-close').addEventListener('click', () => {
   document.getElementById('share-code-modal').classList.add('hidden');
+});
+
+document.getElementById('share-songlist-btn').addEventListener('click', () => {
+  const pl = _currentSharePl;
+  const btn = document.getElementById('share-songlist-btn');
+  if (!pl || !pl.songs || pl.songs.length === 0) {
+    btn.textContent = '곡이 없습니다.';
+    setTimeout(() => { btn.textContent = '곡 목록을 텍스트로 복사'; }, 2000);
+    return;
+  }
+  const lines = [`🎵 ${pl.name}`, ''];
+  pl.songs.forEach((song, i) => {
+    lines.push(`${i + 1}. ${song.title}${song.channel ? ' - ' + song.channel : ''}`);
+    lines.push(`   https://www.youtube.com/watch?v=${song.videoId}`);
+    lines.push('');
+  });
+  navigator.clipboard.writeText(lines.join('\n').trimEnd()).then(() => {
+    btn.textContent = '✅ 곡 목록이 복사되었습니다!';
+    setTimeout(() => { btn.textContent = '곡 목록을 텍스트로 복사'; }, 2500);
+  }).catch(() => {
+    btn.textContent = '복사에 실패했습니다.';
+    setTimeout(() => { btn.textContent = '곡 목록을 텍스트로 복사'; }, 2000);
+  });
 });
 
 // 불러오기 버튼
@@ -1035,6 +1523,97 @@ document.getElementById('import-code-input').addEventListener('keydown', e => {
   if (e.key === 'Enter') document.getElementById('import-playlist-confirm').click();
 });
 
+// ── 레이아웃 리사이즈 공통: 중앙 활동 로그 최소 폭 보장 ──
+const CENTER_MIN_WIDTH = 200;
+
+function getSearchSectionWidth() {
+  const search = document.getElementById('search-section');
+  if (!search || search.classList.contains('collapsed')) return 0;
+  return search.getBoundingClientRect().width || parseInt(search.style.width) || 0;
+}
+
+function getSidebarWidth() {
+  const sidebar = document.getElementById('sidebar');
+  if (!sidebar) return 0;
+  return sidebar.getBoundingClientRect().width || parseInt(sidebar.style.width) || 0;
+}
+
+// "사용자가 실제로 원하는 너비"와 "지금 공간이 부족해 화면에 강제로 맞춘 너비"를 구분한다.
+// localStorage에는 오직 사용자가 직접 드래그를 마쳤을 때(mouseup)만 기록되므로,
+// 여기서 읽는 값은 항상 오염되지 않은 "원래 희망 너비"다.
+// 사용자가 쓸 수 있는 최소 너비. 공간이 부족해 화면상 이보다 좁게 그려질 수는 있어도,
+// "희망 너비"가 이 아래로 저장되지는 않게 해서 다시 넓힐 수 없는 상태를 막는다.
+const SIDEBAR_MIN_WIDTH = 260;
+const SEARCH_MIN_WIDTH  = 200;
+const SEARCH_MAX_WIDTH  = 700;
+
+function getDesiredSidebarWidth() {
+  const saved = localStorage.getItem('jukesync-sidebar-width');
+  const w = saved ? parseInt(saved, 10) : getSidebarWidth();
+  return Math.max(SIDEBAR_MIN_WIDTH, w || SIDEBAR_MIN_WIDTH);
+}
+function getDesiredSearchWidth() {
+  const saved = localStorage.getItem('jukesync-search-width');
+  const w = saved ? parseInt(saved, 10) : getSearchSectionWidth();
+  return Math.min(SEARCH_MAX_WIDTH, Math.max(SEARCH_MIN_WIDTH, w || SEARCH_MIN_WIDTH));
+}
+
+// 사이드바/검색창 너비를 한 번에 같이 계산해서 확정한다.
+// (예전에는 두 함수가 서로의 "현재" 렌더링 너비를 각자 따로 읽어가며 계산했는데,
+//  드래그 중처럼 값이 빠르게 바뀌는 상황에서는 그 상호 참조 때문에 진동이 생길 수 있었다.
+//  창 너비 하나의 스냅샷을 기준으로 두 값을 한 번에 확정하면 그 문제가 사라진다.)
+function enforceLayoutMinimums() {
+  const sidebar = document.getElementById('sidebar');
+  const search  = document.getElementById('search-section');
+  if (!sidebar) return;
+
+  const total = window.innerWidth;
+  const searchCollapsed = !search || search.classList.contains('collapsed');
+
+  // 화면상 현재 너비가 아니라, 사용자가 실제로 원하는(오염되지 않은) 희망 너비를 기준으로 삼는다.
+  const sidebarWish = getDesiredSidebarWidth();
+  const searchWish  = searchCollapsed ? 0 : getDesiredSearchWidth();
+
+  // 1) 사이드바: 활동 로그 최소 200px을 뺀 나머지 안에서 희망 너비까지
+  const sidebarFinal = Math.max(0, Math.min(sidebarWish, total - CENTER_MIN_WIDTH));
+  // 2) 검색창: 사이드바 확정값 + 활동 로그 200px을 뺀 나머지 안에서 희망 너비까지
+  const searchFinal  = searchCollapsed ? 0 : Math.max(0, Math.min(searchWish, total - sidebarFinal - CENTER_MIN_WIDTH));
+
+  // 화면에는 항상 확정값을 반영하되, "공간이 부족해 어쩔 수 없이 줄인 상태"(< 희망 너비)일 때는
+  // localStorage(=사용자의 진짜 희망 너비)를 덮어쓰지 않는다. 그래야 나중에 공간이 생기거나
+  // 탭을 다시 펼쳤을 때 원래 크기로 정확히 복원된다.
+  if (getSidebarWidth() !== sidebarFinal) {
+    sidebar.style.width = sidebarFinal + 'px';
+    if (sidebarFinal >= sidebarWish) localStorage.setItem('jukesync-sidebar-width', sidebarFinal);
+  }
+  const layout = document.querySelector('.room-layout');
+  if (layout) layout.style.gridTemplateColumns = `${sidebarFinal}px 1fr auto`;
+
+  if (!searchCollapsed && getSearchSectionWidth() !== searchFinal) {
+    search.style.width    = searchFinal + 'px';
+    search.style.minWidth = searchFinal < 200 ? searchFinal + 'px' : '';
+    if (searchFinal >= searchWish) localStorage.setItem('jukesync-search-width', searchFinal);
+  }
+}
+
+function clampSidebarToViewport() { enforceLayoutMinimums(); }
+function clampSearchToViewport()  { enforceLayoutMinimums(); }
+
+let layoutClampRAF = null;
+function scheduleLayoutClamp() {
+  if (layoutClampRAF) cancelAnimationFrame(layoutClampRAF);
+  // 창 드래그 중 resize가 매우 짧은 간격으로 연달아 발생하면, 레이아웃이 아직
+  // 확정되기 전 값을 읽어 계산이 어긋날 수 있다. 다음 프레임까지 미뤄서
+  // 브라우저가 레이아웃을 확정한 뒤의 값을 읽도록 한다.
+  layoutClampRAF = requestAnimationFrame(() => {
+    layoutClampRAF = null;
+    clampSidebarToViewport();
+    clampSearchToViewport();
+  });
+}
+
+window.addEventListener('resize', scheduleLayoutClamp);
+
 // ── Sidebar Resize ───────────────────────────
 (function() {
   const sidebar = document.getElementById('sidebar');
@@ -1051,6 +1630,8 @@ document.getElementById('import-code-input').addEventListener('keydown', e => {
     const layout = document.querySelector('.room-layout');
     if (layout) layout.style.gridTemplateColumns = `${saved}px 1fr auto`;
   }
+  // 저장된 값이 현재 창 크기(또는 검색창 상태)와 안 맞을 수 있으니 로드 시 한 번 보정
+  clampSidebarToViewport();
 
   handle.addEventListener('mousedown', e => {
     e.preventDefault();
@@ -1059,7 +1640,9 @@ document.getElementById('import-code-input').addEventListener('keydown', e => {
     const startWidth = sidebar.getBoundingClientRect().width;
 
     function onMouseMove(e) {
-      const newWidth = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, startWidth + e.clientX - startX));
+      // 검색창(펼쳐져 있다면 그 너비)과 활동 로그 최소 200px을 뺀 나머지가 상한
+      const dynamicMax = window.innerWidth - getSearchSectionWidth() - CENTER_MIN_WIDTH;
+      const newWidth = Math.min(MAX_WIDTH, dynamicMax, Math.max(MIN_WIDTH, startWidth + e.clientX - startX));
       sidebar.style.width = newWidth + 'px';
       const layout = document.querySelector('.room-layout');
       if (layout) layout.style.gridTemplateColumns = `${newWidth}px 1fr auto`;
@@ -1092,9 +1675,11 @@ document.getElementById('import-code-input').addEventListener('keydown', e => {
   const COLLAPSED_KEY = 'jukesync-search-collapsed';
   const WIDTH_KEY     = 'jukesync-search-width';
 
-  // 너비 복원
-  const savedWidth = localStorage.getItem(WIDTH_KEY);
-  if (savedWidth) section.style.width = savedWidth + 'px';
+  // 너비 복원 — 저장값이 사용 가능 최소치보다 작아도 보정된 값으로 되살린다
+  section.style.width    = getDesiredSearchWidth() + 'px';
+  section.style.minWidth = '';
+  // 저장된 값이 현재 창 크기(또는 사이드바 상태)와 안 맞을 수 있으니 로드 시 한 번 보정
+  clampSearchToViewport();
 
   // 접기 상태 복원
   if (localStorage.getItem(COLLAPSED_KEY) === '1') {
@@ -1110,9 +1695,17 @@ document.getElementById('import-code-input').addEventListener('keydown', e => {
     localStorage.setItem(COLLAPSED_KEY, isCollapsed ? '1' : '0');
     // 접힌 상태에서는 너비 저장 안 함
     if (!isCollapsed) {
-      const savedWidth = localStorage.getItem('jukesync-search-width');
-      if (savedWidth) section.style.width = savedWidth + 'px';
+      // 좁혀진 채 저장돼 있었더라도 다시 쓸 수 있는 너비로 펼친다
+      section.style.width    = getDesiredSearchWidth() + 'px';
+      section.style.minWidth = '';
+      clampSearchToViewport();
+    } else {
+      // 좁혀진 상태에서 넣어둔 인라인 min-width가 남아 있으면 접어도 그 폭만큼 빈 띠가 남는다.
+      // (인라인 스타일이 .collapsed 규칙의 min-width:0 보다 우선하기 때문)
+      section.style.minWidth = '';
+      section.style.width    = '';
     }
+    updateMiniPlayerPosition();
   });
 
   // ── 드래그 리사이즈 ──
@@ -1123,15 +1716,25 @@ document.getElementById('import-code-input').addEventListener('keydown', e => {
     resizeHandle.classList.add('dragging');
     section.classList.add('resizing');
 
+    let desiredWidth = startWidth; // 사용자가 의도한 너비 (화면에 그려진 너비와 별개)
+
     function onMove(e) {
-      const delta    = startX - e.clientX; // 왼쪽으로 드래그 = 넓어짐
-      const newWidth = Math.min(700, Math.max(200, startWidth + delta));
-      section.style.width = newWidth + 'px';
+      const delta = startX - e.clientX; // 왼쪽으로 드래그 = 넓어짐
+      // 사용자가 끌 수 있는 범위는 200~700px로 제한한다.
+      // (0까지 줄어들면 드래그 핸들을 다시 잡을 수 없게 되므로)
+      desiredWidth = Math.min(SEARCH_MAX_WIDTH, Math.max(SEARCH_MIN_WIDTH, startWidth + delta));
+      // 다만 화면에 실제로 그릴 때는 활동 로그 200px 확보가 우선이므로,
+      // 공간이 모자라면 희망 너비보다 좁게(필요하면 200px 미만으로도) 그린다.
+      const dynamicMax = window.innerWidth - getSidebarWidth() - CENTER_MIN_WIDTH;
+      const rendered   = Math.max(0, Math.min(desiredWidth, dynamicMax));
+      section.style.width    = rendered + 'px';
+      section.style.minWidth = rendered < SEARCH_MIN_WIDTH ? rendered + 'px' : '';
     }
     function onUp() {
       resizeHandle.classList.remove('dragging');
       section.classList.remove('resizing');
-      localStorage.setItem(WIDTH_KEY, parseInt(section.style.width));
+      // 그려진 너비가 아니라 "희망 너비"를 저장한다.
+      localStorage.setItem(WIDTH_KEY, desiredWidth);
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup', onUp);
     }
